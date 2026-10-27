@@ -16,7 +16,11 @@ import pytest
 
 from dummyserver.socketserver import NoIPv6Warning
 from dummyserver.testcase import HypercornDummyServerTestCase, SocketDummyServerTestCase
-from urllib3 import HTTPConnectionPool, encode_multipart_formdata
+from urllib3 import (
+    HTTPConnectionPool,
+    ConnectionOwnership,
+    encode_multipart_formdata,
+)
 from urllib3._collections import HTTPHeaderDict
 from urllib3.connection import _get_default_user_agent
 from urllib3.exceptions import (
@@ -918,6 +922,85 @@ class TestConnectionPool(HypercornDummyServerTestCase):
             )
 
             assert b"123" * 4 == response.read()
+
+    def test_consumption_state_streaming_keepalive(self) -> None:
+        with HTTPConnectionPool(self.host, self.port) as pool:
+            response = pool.urlopen(
+                "GET",
+                "/",
+                preload_content=False,
+                release_conn=False,
+                retries=False,
+                track_consumption_state=True,
+            )
+            state = response.consumption_state
+            assert state is not None
+            assert state.connection_ownership is ConnectionOwnership.HELD
+            assert not state.eof_reached
+
+            payload = b"".join(response.stream())
+            assert payload
+            assert state.eof_reached and state.is_complete
+            assert state.connection_ownership is ConnectionOwnership.RELEASED
+            assert state.connection_reusable
+            assert state.raw_bytes_read == state.decoded_bytes_read == len(payload)
+            assert state.error is None
+
+            # The consumed connection is reused for the next request.
+            follow_up = pool.urlopen(
+                "GET",
+                "/",
+                preload_content=False,
+                release_conn=False,
+                retries=False,
+                track_consumption_state=True,
+            )
+            assert pool.num_connections == 1
+            assert follow_up.consumption_state.response_id != state.response_id
+
+    def test_consumption_state_chunked_framing(self) -> None:
+        with HTTPConnectionPool(self.host, self.port) as pool:
+            response = pool.urlopen(
+                "GET",
+                "/chunked",
+                preload_content=False,
+                release_conn=False,
+                retries=False,
+                track_consumption_state=True,
+            )
+            payload = b"".join(response.stream())
+            assert payload == b"123" * 4
+            state = response.consumption_state
+            assert state is not None
+            assert state.decoded_bytes_read == 12
+            # Raw progress additionally covers chunk-size lines and CRLFs.
+            assert state.raw_bytes_read > 12
+            assert state.eof_reached and state.is_complete
+            assert state.connection_ownership is ConnectionOwnership.RELEASED
+            assert state.connection_reusable
+            assert pool.num_connections == 1
+
+    def test_consumption_state_preloaded(self) -> None:
+        with HTTPConnectionPool(self.host, self.port) as pool:
+            response = pool.urlopen(
+                "GET",
+                "/",
+                preload_content=True,
+                retries=False,
+                track_consumption_state=True,
+            )
+            state = response.consumption_state
+            assert state is not None
+            assert response.data
+            assert state.eof_reached and state.is_complete and state.connection_reusable
+            assert state.decoded_bytes_read == len(response.data)
+            assert state.raw_bytes_read == state.decoded_bytes_read
+
+    def test_consumption_state_disabled_by_default(self) -> None:
+        with HTTPConnectionPool(self.host, self.port) as pool:
+            response = pool.urlopen("GET", "/", preload_content=False, retries=False)
+            assert response.consumption_state is None
+            b"".join(response.stream())
 
     def test_cleanup_on_connection_error(self) -> None:
         """

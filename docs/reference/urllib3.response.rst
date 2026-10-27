@@ -19,6 +19,23 @@ Response
     .. autoattribute:: status
     .. autoattribute:: headers
 
+Consumption state
+-----------------
+
+When a response is created with ``track_consumption_state=True`` (or the
+same option is passed through ``urlopen()``/``request()``),
+:attr:`urllib3.response.BaseHTTPResponse.consumption_state` returns a live
+record of how the response body has been consumed and who owns its
+connection. Querying the record never performs a network read.
+
+.. autoclass:: urllib3.response.ResponseConsumptionState
+    :members:
+    :undoc-members:
+
+.. autoclass:: urllib3.response.ConnectionOwnership
+    :members:
+    :undoc-members:
+
 Decoders
 --------
 

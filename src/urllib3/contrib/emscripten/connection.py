@@ -96,7 +96,11 @@ class EmscriptenHTTPConnection:
         preload_content: bool = True,
         decode_content: bool = True,
         enforce_content_length: bool = True,
+        track_consumption_state: bool = False,
     ) -> None:
+        # The browser owns the connection lifecycle, so consumption state
+        # is not tracked on this platform; the argument is accepted for API
+        # compatibility with the standard HTTPConnection.
         self._closed = False
         if url.startswith("/"):
             if self.port is not None:

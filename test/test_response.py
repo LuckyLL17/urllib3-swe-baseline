@@ -30,8 +30,10 @@ from urllib3.response import (  # type: ignore[attr-defined]
     _MAX_CHUNK_LINE_LENGTH,
     BaseHTTPResponse,
     BytesQueueBuffer,
+    ConnectionOwnership,
     GzipDecoder,
     HTTPResponse,
+    ResponseConsumptionState,
     brotli,
 )
 from urllib3.util.response import is_fp_closed
@@ -2156,6 +2158,480 @@ class TestResponse:
             resp = HTTPResponse(fp, status=204)
             resp.read(16)
         assert "Response may not contain content" in str(excinfo.value)
+
+
+def gzip_compress(data: bytes) -> bytes:
+    compress = zlib.compressobj(6, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+    return compress.compress(data) + compress.flush()
+
+
+def chunked_httplib_response(
+    chunks: list[bytes], method: str = "GET"
+) -> httplib.HTTPResponse:
+    r = httplib.HTTPResponse(MockSock)  # type: ignore[arg-type]
+    r.fp = MockChunkedEncodingResponse(chunks)  # type: ignore[assignment]
+    r.chunked = True
+    r.chunk_left = None
+    r._method = method  # type: ignore[attr-defined]
+    return r
+
+
+def content_length_httplib_response(body: bytes) -> httplib.HTTPResponse:
+    r = httplib.HTTPResponse(MockSock)  # type: ignore[arg-type]
+    r.fp = BytesIO(body)  # type: ignore[assignment]
+    r.chunked = 0  # type: ignore[assignment]
+    r.length = len(body)
+    r._method = "GET"  # type: ignore[attr-defined]
+    return r
+
+
+class TestConsumptionState:
+    def test_disabled_by_default(self) -> None:
+        resp = HTTPResponse(BytesIO(b"foo"), preload_content=False)
+        assert resp.consumption_state is None
+        assert resp.read() == b"foo"
+        assert resp.consumption_state is None
+
+    def test_stable_identity(self) -> None:
+        r1 = HTTPResponse(BytesIO(b"a"), track_consumption_state=True)
+        r2 = HTTPResponse(BytesIO(b"bb"), track_consumption_state=True)
+        s1, s2 = r1.consumption_state, r2.consumption_state
+        assert isinstance(s1, ResponseConsumptionState)
+        assert s1.response_id != s2.response_id
+        assert r1.consumption_state is s1
+        assert s1.response_id == s1.response_id
+
+    def test_bytes_body_owned_by_no_one_and_complete(self) -> None:
+        resp = HTTPResponse(b"abc", track_consumption_state=True)
+        st = resp.consumption_state
+        assert st.connection_ownership is ConnectionOwnership.NONE
+        assert st.eof_reached and st.is_complete and st.connection_reusable
+        assert st.raw_bytes_read == 0 and st.decoded_bytes_read == 3
+        assert resp.data == b"abc"
+        # Cached .data accesses do not count again.
+        assert st.decoded_bytes_read == 3
+
+    def test_partial_then_full_read_progress(self) -> None:
+        resp = HTTPResponse(
+            BytesIO(b"hello world"),
+            preload_content=False,
+            headers={"content-length": "11"},
+            track_consumption_state=True,
+        )
+        st = resp.consumption_state
+        assert not st.eof_reached and not st.is_complete
+        assert resp.read(3) == b"hel"
+        assert st.raw_bytes_read == 3 and st.decoded_bytes_read == 3
+        assert not st.eof_reached and not st.connection_reusable
+        assert resp.read() == b"lo world"
+        assert st.raw_bytes_read == 11 and st.decoded_bytes_read == 11
+        assert st.eof_reached and st.is_complete and st.connection_reusable
+        assert st.error is None
+
+    def test_zero_byte_reads_do_not_signal_eof(self) -> None:
+        resp = HTTPResponse(
+            BytesIO(b"hello world"),
+            preload_content=False,
+            headers={"content-length": "11"},
+            track_consumption_state=True,
+        )
+        st = resp.consumption_state
+        assert resp.read(0) == b""
+        assert not st.eof_reached
+        assert st.raw_bytes_read == 0 and st.decoded_bytes_read == 0
+        assert resp.read1(0) == b""
+        assert not st.eof_reached
+        assert resp.read() == b"hello world"
+        assert st.eof_reached and st.is_complete
+
+    def test_read1_progress(self) -> None:
+        resp = HTTPResponse(
+            BytesIO(b"hello world"),
+            preload_content=False,
+            headers={"content-length": "11"},
+            track_consumption_state=True,
+        )
+        st = resp.consumption_state
+        assert resp.read1(5) == b"hello"
+        assert st.raw_bytes_read == 5 and st.decoded_bytes_read == 5
+        assert resp.read1() == b" world"
+        assert st.raw_bytes_read == 11 and st.decoded_bytes_read == 11
+        assert st.eof_reached and st.is_complete and st.connection_reusable
+
+    def test_stream_progress_and_final_state(self) -> None:
+        resp = HTTPResponse(
+            BytesIO(b"hello world"),
+            preload_content=False,
+            headers={"content-length": "11"},
+            track_consumption_state=True,
+        )
+        chunks = list(resp.stream(4))
+        assert chunks == [b"hell", b"o wo", b"rld"]
+        st = resp.consumption_state
+        assert st.raw_bytes_read == 11 and st.decoded_bytes_read == 11
+        assert st.is_complete and st.connection_reusable
+
+    def test_data_counts_once(self) -> None:
+        resp = HTTPResponse(
+            BytesIO(b"hello world"),
+            preload_content=False,
+            headers={"content-length": "11"},
+            track_consumption_state=True,
+        )
+        assert resp.data == b"hello world"
+        st = resp.consumption_state
+        assert st.decoded_bytes_read == 11
+        assert resp.data == b"hello world"
+        assert st.decoded_bytes_read == 11
+
+    def test_preloaded_compressed_body(self) -> None:
+        payload = b"foobar" * 100
+        encoded = gzip_compress(payload)
+        resp = HTTPResponse(
+            BytesIO(encoded),
+            headers={
+                "content-encoding": "gzip",
+                "content-length": str(len(encoded)),
+            },
+            track_consumption_state=True,
+        )
+        st = resp.consumption_state
+        assert resp.data == payload
+        assert st.raw_bytes_read == len(encoded)
+        assert st.decoded_bytes_read == len(payload)
+        assert st.eof_reached and st.is_complete and st.connection_reusable
+        assert st.raw_bytes_read < st.decoded_bytes_read
+
+    def test_chunked_counts_framing_as_raw(self) -> None:
+        r = chunked_httplib_response([b"fo", b"o", b"bar"])
+        resp = HTTPResponse(
+            r,
+            preload_content=False,
+            headers={"transfer-encoding": "chunked"},
+            original_response=r,
+            track_consumption_state=True,
+        )
+        st = resp.consumption_state
+        payload = b"".join(resp.read_chunked(2))
+        # "2\r\nfo\r\n" + "1\r\no\r\n" + "3\r\nbar\r\n" + "0\r\n" + "\r\n"
+        assert st.raw_bytes_read == 7 + 6 + 8 + 3 + 2
+        assert st.decoded_bytes_read == 6
+        assert payload == b"foobar"
+        assert st.eof_reached and st.is_complete and st.connection_reusable
+
+    def test_chunked_auto_releases_to_pool(self) -> None:
+        pool = mock.Mock()
+        conn = mock.Mock()
+        r = chunked_httplib_response([b"abc"])
+        resp = HTTPResponse(
+            r,
+            preload_content=False,
+            headers={"transfer-encoding": "chunked"},
+            original_response=r,
+            pool=pool,
+            connection=conn,
+            track_consumption_state=True,
+        )
+        st = resp.consumption_state
+        assert st.connection_ownership is ConnectionOwnership.HELD
+        assert b"".join(resp.read_chunked()) == b"abc"
+        assert st.connection_ownership is ConnectionOwnership.RELEASED
+        assert st.connection_reusable and st.is_complete
+        pool._put_conn.assert_called_once_with(conn)
+
+    def test_chunked_gzip_raw_and_decoded_progress(self) -> None:
+        payload = b"foobar" * 50
+        encoded = gzip_compress(payload)
+        chunks = [encoded[i : i + 7] for i in range(0, len(encoded), 7)]
+        r = chunked_httplib_response(chunks)
+        resp = HTTPResponse(
+            r,
+            preload_content=False,
+            headers={"transfer-encoding": "chunked", "content-encoding": "gzip"},
+            original_response=r,
+            track_consumption_state=True,
+        )
+        assert b"".join(resp.stream(decode_content=True)) == payload
+        st = resp.consumption_state
+        assert st.decoded_bytes_read == len(payload)
+        assert len(encoded) < st.raw_bytes_read < len(payload)
+        assert st.is_complete and st.eof_reached and st.connection_reusable
+
+    def test_chunked_invalid_length_discards(self) -> None:
+        pool, conn = mock.Mock(), mock.Mock()
+        r = httplib.HTTPResponse(MockSock)  # type: ignore[arg-type]
+        r.fp = MockChunkedInvalidChunkLength([b"foo"])  # type: ignore[assignment]
+        r.chunked = True
+        r.chunk_left = None
+        r._method = "GET"  # type: ignore[attr-defined]
+        resp = HTTPResponse(
+            r,
+            preload_content=False,
+            headers={"transfer-encoding": "chunked"},
+            original_response=r,
+            pool=pool,
+            connection=conn,
+            track_consumption_state=True,
+        )
+        with pytest.raises(ProtocolError) as ctx:
+            next(resp.read_chunked())
+        assert isinstance(ctx.value.args[1], InvalidChunkLength)
+        st = resp.consumption_state
+        assert st.error is ctx.value
+        assert not st.eof_reached
+        assert st.connection_ownership is ConnectionOwnership.CLOSED
+        assert not st.connection_reusable
+
+    def test_chunked_abandon_is_discarded_without_read_error(self) -> None:
+        pool, conn = mock.Mock(), mock.Mock()
+        r = chunked_httplib_response([b"fo", b"o", b"bar"])
+        resp = HTTPResponse(
+            r,
+            preload_content=False,
+            headers={"transfer-encoding": "chunked"},
+            original_response=r,
+            pool=pool,
+            connection=conn,
+            track_consumption_state=True,
+        )
+        gen = resp.read_chunked()
+        assert next(gen) == b"fo"
+        gen.close()
+        st = resp.consumption_state
+        # Abandoning the stream is not a read/decode error, but the
+        # half-read connection cannot serve another request.
+        assert st.error is None
+        assert not st.eof_reached
+        assert st.connection_ownership is ConnectionOwnership.CLOSED
+        assert not st.connection_reusable
+
+    def test_chunked_head_response_is_complete(self) -> None:
+        r = chunked_httplib_response([], method="HEAD")
+        resp = HTTPResponse(
+            r,
+            preload_content=False,
+            headers={"transfer-encoding": "chunked"},
+            original_response=r,
+            track_consumption_state=True,
+        )
+        assert list(resp.read_chunked()) == []
+        st = resp.consumption_state
+        assert st.eof_reached and st.is_complete and st.connection_reusable
+
+    def test_declared_length_longer_than_body_discards(self) -> None:
+        pool, conn = mock.Mock(), mock.Mock()
+        resp = HTTPResponse(
+            BytesIO(b"short"),
+            preload_content=False,
+            headers={"content-length": "100"},
+            pool=pool,
+            connection=conn,
+            track_consumption_state=True,
+        )
+        assert resp.read(3) == b"sho"
+        with pytest.raises(ProtocolError) as ctx:
+            resp.read(3)
+        assert isinstance(ctx.value.args[1], IncompleteRead)
+        st = resp.consumption_state
+        assert st.error is ctx.value
+        assert not st.eof_reached
+        assert st.connection_ownership is ConnectionOwnership.CLOSED
+        assert not st.connection_reusable
+
+    def test_truncated_gzip_is_decode_error(self) -> None:
+        encoded = gzip_compress(b"x" * 1000)
+        middle = len(encoded) // 2
+        corrupted = (
+            encoded[:middle] + bytes([encoded[middle] ^ 0xFF]) + encoded[middle + 1 :]
+        )
+        pool, conn = mock.Mock(), mock.Mock()
+        resp = HTTPResponse(
+            BytesIO(corrupted),
+            preload_content=False,
+            headers={
+                "content-length": str(len(corrupted)),
+                "content-encoding": "gzip",
+            },
+            pool=pool,
+            connection=conn,
+            track_consumption_state=True,
+        )
+        with pytest.raises(DecodeError):
+            resp.read()
+        st = resp.consumption_state
+        assert isinstance(st.error, DecodeError)
+        assert not st.connection_reusable
+
+    def test_close_before_complete_and_double_close(self) -> None:
+        pool, conn = mock.Mock(), mock.Mock()
+        resp = HTTPResponse(
+            BytesIO(b"hello world"),
+            preload_content=False,
+            headers={"content-length": "11"},
+            pool=pool,
+            connection=conn,
+            track_consumption_state=True,
+        )
+        resp.read(3)
+        resp.close()
+        resp.close()
+        st = resp.consumption_state
+        assert st.connection_ownership is ConnectionOwnership.CLOSED
+        assert not st.eof_reached and not st.connection_reusable
+        # Existing close() behaviour closes the held connection on every
+        # call; the state transition itself stays idempotent.
+        assert conn.close.call_count == 2
+        assert st.connection_ownership is ConnectionOwnership.CLOSED
+
+    def test_release_conn_before_end_then_continue_reading(self) -> None:
+        pool, conn = mock.Mock(), mock.Mock()
+        resp = HTTPResponse(
+            BytesIO(b"hello world"),
+            preload_content=False,
+            headers={"content-length": "11"},
+            pool=pool,
+            connection=conn,
+            track_consumption_state=True,
+        )
+        resp.read(3)
+        resp.release_conn()
+        st = resp.consumption_state
+        pool._put_conn.assert_called_once_with(conn)
+        assert st.connection_ownership is ConnectionOwnership.RELEASED
+        assert not st.connection_reusable and not st.eof_reached
+        # Reading on after releasing keeps updating the same state.
+        assert resp.read() == b"lo world"
+        assert st.eof_reached and st.is_complete and st.connection_reusable
+        assert st.connection_ownership is ConnectionOwnership.RELEASED
+        # Idempotent release.
+        resp.release_conn()
+        assert st.connection_ownership is ConnectionOwnership.RELEASED
+
+    def test_drain_conn_completes_and_releases(self) -> None:
+        pool, conn = mock.Mock(), mock.Mock()
+        hlr = content_length_httplib_response(b"hello world")
+        resp = HTTPResponse(
+            hlr,
+            preload_content=False,
+            headers={"content-length": "11"},
+            original_response=hlr,
+            pool=pool,
+            connection=conn,
+            track_consumption_state=True,
+        )
+        resp.read(3)
+        resp.drain_conn()
+        st = resp.consumption_state
+        assert st.raw_bytes_read == 11
+        # Discarded bytes were never delivered, so decoded progress stays.
+        assert st.decoded_bytes_read == 3
+        assert st.eof_reached and st.is_complete
+        assert st.connection_ownership is ConnectionOwnership.RELEASED
+        assert st.connection_reusable
+        pool._put_conn.assert_called_once_with(conn)
+
+    def test_drain_conn_with_error_discards(self) -> None:
+        class FailingBytesIO(BytesIO):
+            def read(self, amt: int = -1) -> bytes:  # type: ignore[override]
+                raise OSError("boom")
+
+        pool, conn = mock.Mock(), mock.Mock()
+        hlr = content_length_httplib_response(b"hello world")
+        hlr.fp = FailingBytesIO(b"hello world")  # type: ignore[assignment]
+        resp = HTTPResponse(
+            hlr,
+            preload_content=False,
+            headers={"content-length": "11"},
+            original_response=hlr,
+            pool=pool,
+            connection=conn,
+            track_consumption_state=True,
+        )
+        resp.drain_conn()
+        st = resp.consumption_state
+        assert isinstance(st.error, ProtocolError)
+        assert not st.eof_reached and not st.connection_reusable
+        assert st.connection_ownership is ConnectionOwnership.CLOSED
+
+    def test_read_error_discards_connection(self) -> None:
+        class FailingBytesIO(BytesIO):
+            def read(self, amt: int = -1) -> bytes:  # type: ignore[override]
+                raise OSError("boom")
+
+        pool, conn = mock.Mock(), mock.Mock()
+        resp = HTTPResponse(
+            FailingBytesIO(b"x" * 50),
+            preload_content=False,
+            headers={"content-length": "50"},
+            pool=pool,
+            connection=conn,
+            track_consumption_state=True,
+        )
+        with pytest.raises(ProtocolError):
+            resp.read(10)
+        st = resp.consumption_state
+        assert isinstance(st.error, ProtocolError)
+        assert st.connection_ownership is ConnectionOwnership.CLOSED
+        assert not st.connection_reusable
+
+    def test_querying_state_performs_no_io(self) -> None:
+        fp = BytesIO(b"hello world")
+        resp = HTTPResponse(
+            fp,
+            preload_content=False,
+            headers={"content-length": "11"},
+            track_consumption_state=True,
+        )
+        resp.read(2)
+        position_before = fp.tell()
+        st = resp.consumption_state
+        # Repeatedly query every field; these must be pure in-memory reads.
+        for _ in range(3):
+            _ = (
+                st.raw_bytes_read,
+                st.decoded_bytes_read,
+                st.eof_reached,
+                st.error,
+                st.connection_ownership,
+                st.is_complete,
+                st.connection_reusable,
+            )
+        assert fp.tell() == position_before
+
+        with mock.patch.object(fp, "read") as fp_read:
+            st2 = resp.consumption_state
+            _ = (
+                st2.raw_bytes_read,
+                st2.decoded_bytes_read,
+                st2.eof_reached,
+                st2.is_complete,
+                st2.connection_reusable,
+                st2.connection_ownership,
+                st2.error,
+            )
+            fp_read.assert_not_called()
+
+    def test_tracking_does_not_change_bytes_or_exceptions(self) -> None:
+        tracked = HTTPResponse(
+            BytesIO(b"short"),
+            preload_content=False,
+            headers={"content-length": "100"},
+            enforce_content_length=True,
+            track_consumption_state=True,
+        )
+        plain = HTTPResponse(
+            BytesIO(b"short"),
+            preload_content=False,
+            headers={"content-length": "100"},
+            enforce_content_length=True,
+        )
+        assert tracked.read(3) == plain.read(3) == b"sho"
+        with pytest.raises(ProtocolError) as plain_ctx:
+            plain.read(3)
+        with pytest.raises(ProtocolError) as tracked_ctx:
+            tracked.read(3)
+        assert repr(plain_ctx.value) == repr(tracked_ctx.value)
+        assert tracked.consumption_state.error is tracked_ctx.value
 
 
 class MockChunkedEncodingResponse:

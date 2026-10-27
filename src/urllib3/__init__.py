@@ -18,7 +18,12 @@ from ._version import __version__
 from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, connection_from_url
 from .filepost import _TYPE_FIELDS, encode_multipart_formdata
 from .poolmanager import PoolManager, ProxyManager, proxy_from_url
-from .response import BaseHTTPResponse, HTTPResponse
+from .response import (
+    BaseHTTPResponse,
+    ConnectionOwnership,
+    HTTPResponse,
+    ResponseConsumptionState,
+)
 from .util.request import make_headers
 from .util.retry import Retry
 from .util.timeout import Timeout
@@ -66,6 +71,8 @@ __all__ = (
     "proxy_from_url",
     "request",
     "BaseHTTPResponse",
+    "ConnectionOwnership",
+    "ResponseConsumptionState",
 )
 
 logging.getLogger(__name__).addHandler(NullHandler())
@@ -127,6 +134,7 @@ def request(
     retries: Retry | bool | int | None = None,
     timeout: Timeout | float | int | None = 3,
     json: typing.Any | None = None,
+    track_consumption_state: bool = False,
 ) -> BaseHTTPResponse:
     """
     A convenience, top-level request method. It uses a module-global ``PoolManager`` instance.
@@ -188,7 +196,15 @@ def request(
         Data to encode and send as JSON with UTF-encoded in the request body.
         The ``"Content-Type"`` header will be set to ``"application/json"``
         unless specified otherwise.
+
+    :param track_consumption_state:
+        If True, the response exposes a live consumption record through
+        ``response.consumption_state``.
     """
+
+    request_kw: dict[str, typing.Any] = {}
+    if track_consumption_state:
+        request_kw["track_consumption_state"] = True
 
     return _DEFAULT_POOL.request(
         method,
@@ -202,6 +218,7 @@ def request(
         retries=retries,
         timeout=timeout,
         json=json,
+        **request_kw,
     )
 
 

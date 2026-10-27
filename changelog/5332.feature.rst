@@ -1,0 +1,11 @@
+Added an optional response consumption state interface. Pass
+``track_consumption_state=True`` to ``HTTPResponse``, ``urlopen()`` or
+``request()`` to get a live ``response.consumption_state`` record with a
+stable response id, raw and decoded read progress, end-of-file status, the
+first read/decode error (if any) and connection ownership
+(``none``/``held``/``released``/``closed``), including a
+``connection_reusable`` conclusion. The state is shared by ``read()``,
+``read1()``, ``stream()``, ``read_chunked()``, ``data``, ``drain_conn()``,
+``release_conn()`` and ``close()``; querying it performs no network reads.
+The feature is disabled by default and leaves all existing streaming,
+decoding, closing, connection-reuse and exception behavior unchanged.

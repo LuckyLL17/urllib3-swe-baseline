@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import collections
+import enum
 import io
+import itertools
 import json as _json
 import logging
 import socket
 import sys
 import typing
 import warnings
+import weakref
 import zlib
 from contextlib import contextmanager
 from http.client import HTTPMessage as _HttplibHTTPMessage
@@ -473,6 +476,162 @@ class BytesQueueBuffer:
         return result
 
 
+class ConnectionOwnership(enum.Enum):
+    """
+    Who currently owns the connection backing an :class:`HTTPResponse`.
+
+    ``NONE``
+        The response was never associated with a pool-managed connection,
+        for example a response built directly from ``bytes``.
+
+    ``HELD``
+        The response still holds the connection. The connection must not
+        be reused for another request until the body is fully consumed or
+        the response is closed.
+
+    ``RELEASED``
+        The connection was handed back to the pool via
+        :meth:`HTTPResponse.release_conn`.
+
+    ``CLOSED``
+        The connection was force-closed (after a read error or via
+        :meth:`HTTPResponse.close`). It is no longer usable and must be
+        discarded.
+    """
+
+    NONE = "none"
+    HELD = "held"
+    RELEASED = "released"
+    CLOSED = "closed"
+
+
+class ResponseConsumptionState:
+    """
+    Live consumption record for an :class:`HTTPResponse`.
+
+    The same instance is returned for the whole lifetime of a response, so
+    it can be kept around while streaming and inspected between reads.
+    Every attribute is an in-memory value: querying the state never
+    performs a socket read and never raises.
+
+    :ivar response_id: Stable identifier of the response, unique within
+        the process for as long as tracking is enabled.
+    :ivar raw_bytes_read: Number of response-body bytes pulled from the
+        underlying file object. For ``Transfer-Encoding: chunked`` this
+        includes the chunk framing (chunk-size lines and CRLFs); for
+        compressed responses it counts the still-encoded wire bytes.
+    :ivar decoded_bytes_read: Number of decoded (or plain, when decoding
+        is disabled) bytes handed back through ``read()``, ``read1()``,
+        ``read_chunked()``, ``stream()`` and ``data``.
+    :ivar eof_reached: Whether the end of the response body was reached
+        cleanly on the wire.
+    :ivar error: The first error raised while reading or decoding, or
+        ``None``. Once set, the error is never overwritten.
+    :ivar connection_ownership: Current :class:`ConnectionOwnership` of
+        the backing connection.
+    """
+
+    __slots__ = (
+        "_connection_discarded",
+        "_response_ref",
+        "connection_ownership",
+        "decoded_bytes_read",
+        "eof_reached",
+        "error",
+        "raw_bytes_read",
+        "response_id",
+    )
+
+    def __init__(
+        self,
+        response_id: int,
+        connection_ownership: ConnectionOwnership,
+        *,
+        response: HTTPResponse,
+    ) -> None:
+        self.response_id = response_id
+        self.raw_bytes_read = 0
+        self.decoded_bytes_read = 0
+        self.eof_reached = False
+        self.error: BaseException | None = None
+        self.connection_ownership = connection_ownership
+        self._connection_discarded = False
+        self._response_ref: weakref.ReferenceType[HTTPResponse] = weakref.ref(response)
+
+    # Mutators shared by every read/release path of HTTPResponse.
+    def _record_raw_bytes(self, n: int) -> None:
+        if n > 0:
+            self.raw_bytes_read += n
+
+    def _record_decoded_bytes(self, n: int) -> None:
+        if n > 0:
+            self.decoded_bytes_read += n
+
+    def _mark_eof(self) -> None:
+        self.eof_reached = True
+
+    def _record_error(self, error: BaseException) -> None:
+        # Terminal state: the first read/decode error always wins.
+        if self.error is None and not isinstance(error, GeneratorExit):
+            self.error = error
+
+    def _mark_held(self) -> None:
+        if self.connection_ownership is ConnectionOwnership.NONE:
+            self.connection_ownership = ConnectionOwnership.HELD
+
+    def _mark_released(self) -> None:
+        if self.connection_ownership is ConnectionOwnership.HELD:
+            self.connection_ownership = ConnectionOwnership.RELEASED
+
+    def _mark_closed(self) -> None:
+        # CLOSED is sticky: handing a force-closed connection to the pool
+        # afterwards is pool-internal accounting, not a release.
+        self._connection_discarded = True
+        if self.connection_ownership in (
+            ConnectionOwnership.NONE,
+            ConnectionOwnership.HELD,
+        ):
+            self.connection_ownership = ConnectionOwnership.CLOSED
+
+    def _decoder_drained(self) -> bool:
+        response = self._response_ref()
+        if response is None:
+            return True
+        return len(response._decoded_buffer) == 0 and not (
+            response._decoder is not None and response._decoder.has_unconsumed_tail
+        )
+
+    @property
+    def is_complete(self) -> bool:
+        """
+        ``True`` if the body was consumed to a clean end-of-file, no read
+        or decode error occurred and there is no decoded data left in
+        internal buffers to return.
+        """
+        return self.eof_reached and self.error is None and self._decoder_drained()
+
+    @property
+    def connection_reusable(self) -> bool:
+        """
+        ``True`` if the backing connection is in a clean protocol state
+        and may serve another request. ``False`` means the connection
+        must be (or already was) discarded.
+        """
+        return (
+            self.error is None and not self._connection_discarded and self.eof_reached
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(response_id={self.response_id}, "
+            f"raw_bytes_read={self.raw_bytes_read}, "
+            f"decoded_bytes_read={self.decoded_bytes_read}, "
+            f"eof_reached={self.eof_reached!r}, error={self.error!r}, "
+            f"connection_ownership={self.connection_ownership.value!r}, "
+            f"connection_reusable={self.connection_reusable!r})"
+        )
+
+
 class BaseHTTPResponse(io.IOBase):
     CONTENT_DECODERS = ["gzip", "x-gzip", "deflate"]
     if brotli is not None:
@@ -512,6 +671,7 @@ class BaseHTTPResponse(io.IOBase):
         self._has_decoded_content = False
         self._request_url: str | None = request_url
         self.retries = retries
+        self._consumption_state: ResponseConsumptionState | None = None
 
         self.chunked = False
         tr_enc = self.headers.get("transfer-encoding", "").lower()
@@ -536,6 +696,18 @@ class BaseHTTPResponse(io.IOBase):
         if self.status in self.REDIRECT_STATUSES:
             return self.headers.get("location")
         return False
+
+    @property
+    def consumption_state(self) -> ResponseConsumptionState | None:
+        """
+        Live consumption record of this response, or ``None`` when
+        consumption tracking was not enabled.
+
+        Querying this never reads from the network and never changes the
+        bytes returned by the streaming methods or the exceptions they
+        raise.
+        """
+        return self._consumption_state
 
     @property
     def data(self) -> bytes:
@@ -615,6 +787,19 @@ class BaseHTTPResponse(io.IOBase):
     def release_conn(self) -> None:
         raise NotImplementedError()
 
+    def _note_pool_connection(self, connection: typing.Any) -> None:
+        """
+        Hook invoked after the pooling layer assigned ``_pool``/
+        ``_connection``; keeps the consumption state's ownership in sync
+        without imposing attribute types on subclasses.
+        """
+        if (
+            self._consumption_state is not None
+            and connection is not None
+            and self._consumption_state.connection_ownership is ConnectionOwnership.NONE
+        ):
+            self._consumption_state._mark_held()
+
     def drain_conn(self) -> None:
         raise NotImplementedError()
 
@@ -675,11 +860,14 @@ class BaseHTTPResponse(io.IOBase):
                 self._has_decoded_content = True
         except self.DECODER_ERROR_CLASSES as e:
             content_encoding = self.headers.get("content-encoding", "").lower()
-            raise DecodeError(
+            decode_error = DecodeError(
                 "Received response with content-encoding: %s, but "
                 "failed to decode it." % content_encoding,
                 e,
-            ) from e
+            )
+            if self._consumption_state is not None:
+                self._consumption_state._record_error(decode_error)
+            raise decode_error from e
         if flush_decoder:
             data += self._flush_decoder()
 
@@ -691,7 +879,13 @@ class BaseHTTPResponse(io.IOBase):
         being used.
         """
         if self._decoder:
-            return self._decoder.decompress(b"") + self._decoder.flush()
+            try:
+                return self._decoder.decompress(b"") + self._decoder.flush()
+            except Exception as e:
+                # Report the failure without changing the exception type.
+                if self._consumption_state is not None:
+                    self._consumption_state._record_error(e)
+                raise
         return b""
 
     # Compatibility methods for `io` module
@@ -749,7 +943,17 @@ class HTTPResponse(BaseHTTPResponse):
     :param enforce_content_length:
         Enforce content length checking. Body returned by server must match
         value of Content-Length header, if present. Otherwise, raise error.
+
+    :param track_consumption_state:
+        If True, keep a live :class:`ResponseConsumptionState` available
+        through :attr:`consumption_state`, recording raw and decoded read
+        progress, end-of-file, read/decode errors and connection
+        ownership. Defaults to False, in which case no extra bookkeeping is
+        done and all streaming, decoding and connection behaviours remain
+        unchanged.
     """
+
+    _response_id_counter: typing.ClassVar[typing.Iterator[int]] = itertools.count(1)
 
     def __init__(
         self,
@@ -771,6 +975,7 @@ class HTTPResponse(BaseHTTPResponse):
         request_url: str | None = None,
         auto_close: bool = True,
         sock_shutdown: typing.Callable[[int], None] | None = None,
+        track_consumption_state: bool = False,
     ) -> None:
         super().__init__(
             headers=headers,
@@ -812,6 +1017,24 @@ class HTTPResponse(BaseHTTPResponse):
         # Used to return the correct amount of bytes for partial read()s
         self._decoded_buffer = BytesQueueBuffer()
 
+        # Must be created before the preload read below so that the
+        # preloading itself is recorded.
+        if track_consumption_state:
+            self._consumption_state = ResponseConsumptionState(
+                response_id=next(self._response_id_counter),
+                connection_ownership=(
+                    ConnectionOwnership.HELD
+                    if self._connection is not None
+                    else ConnectionOwnership.NONE
+                ),
+                response=self,
+            )
+            if self._body is not None:
+                # An in-memory body was supplied directly: nothing is left
+                # to pull and it is fully available from the start.
+                self._consumption_state._mark_eof()
+                self._consumption_state._record_decoded_bytes(len(self._body))
+
         # If requested, preload the body.
         if preload_content and not self._body:
             self._body = self.read(decode_content=decode_content)
@@ -820,6 +1043,8 @@ class HTTPResponse(BaseHTTPResponse):
         if not self._pool or not self._connection:
             return None
 
+        if self._consumption_state is not None:
+            self._consumption_state._mark_released()
         self._pool._put_conn(self._connection)
         self._connection = None
 
@@ -967,6 +1192,16 @@ class HTTPResponse(BaseHTTPResponse):
             # If we didn't terminate cleanly, we need to throw away our
             # connection.
             if not clean_exit:
+                if self._consumption_state is not None:
+                    error = sys.exc_info()[1]
+                    if error is not None:
+                        # GeneratorExit means the caller abandoned the
+                        # stream, not that reading failed; the connection
+                        # is still discarded below.
+                        self._consumption_state._record_error(error)
+                    if self._connection:
+                        self._consumption_state._mark_closed()
+
                 # The response may not be closed but we're not going to use it
                 # anymore so close it now to ensure that the connection is
                 # released back to the pool.
@@ -1087,6 +1322,18 @@ class HTTPResponse(BaseHTTPResponse):
             self._fp_bytes_read += len(data)
             if self.length_remaining is not None:
                 self.length_remaining -= len(data)
+
+        if self._consumption_state is not None:
+            self._consumption_state._record_raw_bytes(len(data) if data else 0)
+            # read(0) pulls no bytes and signals nothing. Otherwise an empty
+            # raw read (read-to-close framing), an fp closed by httplib once
+            # the declared body is exhausted, or length_remaining reaching
+            # zero all mean a clean wire-level EOF. Declared-length short
+            # reads raise IncompleteRead above and never reach this point.
+            if amt != 0 and (
+                not data or is_fp_closed(self._fp) or self.length_remaining == 0
+            ):
+                self._consumption_state._mark_eof()
         return data
 
     def read(
@@ -1138,7 +1385,9 @@ class HTTPResponse(BaseHTTPResponse):
                 )
                 self._decoded_buffer.put(decoded_data)
             if len(self._decoded_buffer) >= amt:
-                return self._decoded_buffer.get(amt)
+                buffered_data = self._decoded_buffer.get(amt)
+                self._record_decoded_bytes(buffered_data)
+                return buffered_data
 
         data = self._raw_read(amt)
         if not cache_content:
@@ -1171,6 +1420,7 @@ class HTTPResponse(BaseHTTPResponse):
                         "Calling read(decode_content=False) is not supported after "
                         "read(decode_content=True) was called."
                     )
+                self._record_decoded_bytes(data)
                 return data
 
             decoded_data = self._decode(
@@ -1195,7 +1445,17 @@ class HTTPResponse(BaseHTTPResponse):
                 self._decoded_buffer.put(decoded_data)
             data = self._decoded_buffer.get(amt)
 
+        self._record_decoded_bytes(data)
         return data
+
+    def _record_decoded_bytes(self, data: bytes | bytearray | None) -> None:
+        """
+        Count bytes actually handed back to the caller. ``stream()`` and
+        the ``data`` property go through ``read()``/``read_chunked()``,
+        so this is the single counting rule shared by every entry point.
+        """
+        if self._consumption_state is not None and data:
+            self._consumption_state._record_decoded_bytes(len(data))
 
     def read1(
         self,
@@ -1242,8 +1502,11 @@ class HTTPResponse(BaseHTTPResponse):
                 self._decoded_buffer.put(decoded_data)
             if len(self._decoded_buffer) > 0:
                 if amt is None:
-                    return self._decoded_buffer.get_all()
-                return self._decoded_buffer.get(amt)
+                    buffered_data = self._decoded_buffer.get_all()
+                else:
+                    buffered_data = self._decoded_buffer.get(amt)
+                self._record_decoded_bytes(buffered_data)
+                return buffered_data
         if amt == 0:
             return b""
 
@@ -1251,6 +1514,7 @@ class HTTPResponse(BaseHTTPResponse):
         data = self._raw_read(amt, read1=True)
         self._uncached_read_occurred = True
         if not decode_content or data is None:
+            self._record_decoded_bytes(data)
             return data
 
         self._init_decoder()
@@ -1265,8 +1529,12 @@ class HTTPResponse(BaseHTTPResponse):
             data = self._raw_read(8192, read1=True)
 
         if amt is None:
-            return self._decoded_buffer.get_all()
-        return self._decoded_buffer.get(amt)
+            decoded_all = self._decoded_buffer.get_all()
+            self._record_decoded_bytes(decoded_all)
+            return decoded_all
+        decoded_amt = self._decoded_buffer.get(amt)
+        self._record_decoded_bytes(decoded_amt)
+        return decoded_amt
 
     def stream(
         self, amt: int | None = _READ_CHUNK_SIZE, decode_content: bool | None = None
@@ -1322,6 +1590,8 @@ class HTTPResponse(BaseHTTPResponse):
             self._fp.close()
 
         if self._connection:
+            if self._consumption_state is not None:
+                self._consumption_state._mark_closed()
             self._connection.close()
 
         if not self.auto_close:
@@ -1374,6 +1644,8 @@ class HTTPResponse(BaseHTTPResponse):
         if self.chunk_left is not None:
             return None
         line = self._fp.fp.readline(_MAX_CHUNK_LINE_LENGTH + 1)  # type: ignore[union-attr]
+        if self._consumption_state is not None:
+            self._consumption_state._record_raw_bytes(len(line))
         if len(line) > _MAX_CHUNK_LINE_LENGTH:
             self.close()
             raise ProtocolError(
@@ -1391,25 +1663,35 @@ class HTTPResponse(BaseHTTPResponse):
                 # Truncated at start of next chunk
                 raise ProtocolError("Response ended prematurely") from None
 
+    def _record_raw_bytes(self, n: int) -> None:
+        if self._consumption_state is not None:
+            self._consumption_state._record_raw_bytes(n)
+
     def _handle_chunk(self, amt: int | None) -> bytes:
         returned_chunk = None
         if amt is None:
             chunk = self._fp._safe_read(self.chunk_left)  # type: ignore[union-attr]
             returned_chunk = chunk
             self._fp._safe_read(2)  # type: ignore[union-attr] # Toss the CRLF at the end of the chunk.
+            self._record_raw_bytes(len(chunk) + 2)
             self.chunk_left = None
         elif self.chunk_left is not None and amt < self.chunk_left:
             value = self._fp._safe_read(amt)  # type: ignore[union-attr]
+            self._record_raw_bytes(len(value))
             self.chunk_left = self.chunk_left - amt
             returned_chunk = value
         elif amt == self.chunk_left:
             value = self._fp._safe_read(amt)  # type: ignore[union-attr]
             self._fp._safe_read(2)  # type: ignore[union-attr] # Toss the CRLF at the end of the chunk.
+            self._record_raw_bytes(len(value) + 2)
             self.chunk_left = None
             returned_chunk = value
         else:  # amt > self.chunk_left
-            returned_chunk = self._fp._safe_read(self.chunk_left)  # type: ignore[union-attr]
+            chunk_left = self.chunk_left
+            returned_chunk = self._fp._safe_read(chunk_left)  # type: ignore[union-attr]
             self._fp._safe_read(2)  # type: ignore[union-attr] # Toss the CRLF at the end of the chunk.
+            if chunk_left is not None:
+                self._record_raw_bytes(chunk_left + 2)
             self.chunk_left = None
         return returned_chunk  # type: ignore[no-any-return]
 
@@ -1445,12 +1727,16 @@ class HTTPResponse(BaseHTTPResponse):
         with self._error_catcher():
             # Don't bother reading the body of a HEAD request.
             if self._original_response and is_response_to_head(self._original_response):
+                if self._consumption_state is not None:
+                    self._consumption_state._mark_eof()
                 self._original_response.close()
                 return None
 
             # If a response is already read and closed
             # then return immediately.
             if self._fp.fp is None:  # type: ignore[union-attr]
+                if self._consumption_state is not None:
+                    self._consumption_state._mark_eof()
                 return None
 
             if amt == 0:
@@ -1468,6 +1754,8 @@ class HTTPResponse(BaseHTTPResponse):
                     self._update_chunk_length()
                     self._uncached_read_occurred = True
                     if self.chunk_left == 0:
+                        if self._consumption_state is not None:
+                            self._consumption_state._mark_eof()
                         break
                     chunk = self._handle_chunk(amt)
                 decoded = self._decode(
@@ -1477,6 +1765,7 @@ class HTTPResponse(BaseHTTPResponse):
                     max_length=amt,
                 )
                 if decoded:
+                    self._record_decoded_bytes(decoded)
                     yield decoded
 
             if decode_content:
@@ -1485,11 +1774,13 @@ class HTTPResponse(BaseHTTPResponse):
                 # lets defensively do it anyway.
                 decoded = self._flush_decoder()
                 if decoded:  # Platform-specific: Jython.
+                    self._record_decoded_bytes(decoded)
                     yield decoded
 
             # Chunk content ends with \r\n: discard it.
             while self._fp is not None:
                 line = self._fp.fp.readline(_MAX_CHUNK_LINE_LENGTH + 1)
+                self._record_raw_bytes(len(line))
                 if len(line) > _MAX_CHUNK_LINE_LENGTH:
                     raise ProtocolError(
                         "Response chunk trailer line exceeded maximum allowed length"

@@ -26,6 +26,7 @@ class _ResponseOptions(typing.NamedTuple):
     preload_content: bool
     decode_content: bool
     enforce_content_length: bool
+    track_consumption_state: bool
 
 
 if typing.TYPE_CHECKING:
@@ -90,6 +91,7 @@ if typing.TYPE_CHECKING:
             preload_content: bool = True,
             decode_content: bool = True,
             enforce_content_length: bool = True,
+            track_consumption_state: bool = False,
         ) -> None: ...
 
         def getresponse(self) -> BaseHTTPResponse: ...

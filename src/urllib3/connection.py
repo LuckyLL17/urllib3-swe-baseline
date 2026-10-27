@@ -176,9 +176,8 @@ class HTTPConnection(_HTTPConnection):
         timeout: _TYPE_TIMEOUT = _DEFAULT_TIMEOUT,
         source_address: tuple[str, int] | None = None,
         blocksize: int = 16384,
-        socket_options: None | (
-            connection._TYPE_SOCKET_OPTIONS
-        ) = default_socket_options,
+        socket_options: None
+        | (connection._TYPE_SOCKET_OPTIONS) = default_socket_options,
         proxy: Url | None = None,
         proxy_config: ProxyConfig | None = None,
     ) -> None:
@@ -516,6 +515,7 @@ class HTTPConnection(_HTTPConnection):
         preload_content: bool = True,
         decode_content: bool = True,
         enforce_content_length: bool = True,
+        track_consumption_state: bool = False,
     ) -> None:
         # Update the inner socket's timeout value to send the request.
         # This only triggers if the connection is re-used.
@@ -536,6 +536,7 @@ class HTTPConnection(_HTTPConnection):
             preload_content=preload_content,
             decode_content=decode_content,
             enforce_content_length=enforce_content_length,
+            track_consumption_state=track_consumption_state,
         )
 
         if headers is None:
@@ -681,6 +682,7 @@ class HTTPConnection(_HTTPConnection):
             request_method=resp_options.request_method,
             request_url=resp_options.request_url,
             sock_shutdown=_shutdown,
+            track_consumption_state=resp_options.track_consumption_state,
         )
         return response
 
@@ -711,9 +713,8 @@ class HTTPSConnection(HTTPConnection):
         timeout: _TYPE_TIMEOUT = _DEFAULT_TIMEOUT,
         source_address: tuple[str, int] | None = None,
         blocksize: int = 16384,
-        socket_options: None | (
-            connection._TYPE_SOCKET_OPTIONS
-        ) = HTTPConnection.default_socket_options,
+        socket_options: None
+        | (connection._TYPE_SOCKET_OPTIONS) = HTTPConnection.default_socket_options,
         proxy: Url | None = None,
         proxy_config: ProxyConfig | None = None,
         cert_reqs: int | str | None = None,

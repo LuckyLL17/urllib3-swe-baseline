@@ -394,6 +394,7 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         preload_content: bool = True,
         decode_content: bool = True,
         enforce_content_length: bool = True,
+        track_consumption_state: bool = False,
     ) -> BaseHTTPResponse:
         """
         Perform a request on a given urllib connection object taken from our
@@ -457,6 +458,10 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         :param enforce_content_length:
             Enforce content length checking. Body returned by server must match
             value of Content-Length header, if present. Otherwise, raise error.
+
+        :param track_consumption_state:
+            If True, the resulting response keeps a consumption state record,
+            available through its ``consumption_state`` attribute.
         """
         self.num_requests += 1
 
@@ -505,6 +510,7 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 preload_content=preload_content,
                 decode_content=decode_content,
                 enforce_content_length=enforce_content_length,
+                track_consumption_state=track_consumption_state,
             )
 
         # We are swallowing BrokenPipeError (errno.EPIPE) since the server is
@@ -546,6 +552,7 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         response.retries = retries
         response._connection = response_conn  # type: ignore[attr-defined]
         response._pool = self  # type: ignore[attr-defined]
+        response._note_pool_connection(response_conn)
 
         log.debug(
             '%s://%s:%s "%s %s %s" %s %s',
@@ -596,6 +603,7 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         body_pos: _TYPE_BODY_POSITION | None = None,
         preload_content: bool = True,
         decode_content: bool = True,
+        track_consumption_state: bool = False,
         **response_kw: typing.Any,
     ) -> BaseHTTPResponse:
         """
@@ -672,6 +680,11 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         :param bool decode_content:
             If True, will attempt to decode the body based on the
             'content-encoding' header.
+
+        :param bool track_consumption_state:
+            If True, the response exposes a live consumption record through
+            ``response.consumption_state``. Defaults to False and has no
+            effect when left disabled.
 
         :param release_conn:
             If False, then the urlopen call will not release the connection
@@ -791,6 +804,7 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 response_conn=response_conn,
                 preload_content=preload_content,
                 decode_content=decode_content,
+                track_consumption_state=track_consumption_state,
                 **response_kw,
             )
 
@@ -887,6 +901,7 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 body_pos=body_pos,
                 preload_content=preload_content,
                 decode_content=decode_content,
+                track_consumption_state=track_consumption_state,
                 **response_kw,
             )
 
@@ -943,6 +958,7 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 body_pos=body_pos,
                 preload_content=preload_content,
                 decode_content=decode_content,
+                track_consumption_state=track_consumption_state,
                 **response_kw,
             )
 
@@ -975,6 +991,7 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 body_pos=body_pos,
                 preload_content=preload_content,
                 decode_content=decode_content,
+                track_consumption_state=track_consumption_state,
                 **response_kw,
             )
 

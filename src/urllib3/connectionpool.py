@@ -27,6 +27,7 @@ from .connection import port_by_scheme as port_by_scheme
 from .exceptions import (
     ClosedPoolError,
     EmptyPoolError,
+    FaultIsolationError,
     FullPoolError,
     HostChangedError,
     InsecureRequestWarning,
@@ -38,6 +39,17 @@ from .exceptions import (
     ReadTimeoutError,
     SSLError,
     TimeoutError,
+)
+from .faultisolation import (
+    FaultIsolationConfig,
+    FaultIsolationPolicy,
+    FaultPermit,
+    FaultReason,
+    FaultSnapshot,
+    _FaultIsolationOpen,
+    classify_connection_fault,
+    create_fault_isolation,
+    is_user_cancellation,
 )
 from .response import BaseHTTPResponse
 from .util.connection import is_connection_dropped
@@ -170,6 +182,15 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         A dictionary with proxy headers, should not be used directly,
         instead, see :class:`urllib3.ProxyManager`
 
+    :param fault_isolation:
+        Optional connection fault isolation policy (circuit breaker). Pass
+        ``True`` for the default :class:`urllib3.FaultIsolationConfig`, a
+        custom config, or an existing :class:`urllib3.FaultIsolationPolicy`.
+        When enabled, repeated connection, proxy, TLS or passive-close
+        failures temporarily open the pool, rejecting new connection
+        attempts until a single half-open probe succeeds. ``None`` (the
+        default) keeps the historical behavior unchanged.
+
     :param \\**conn_kw:
         Additional parameters are used to create fresh :class:`urllib3.connection.HTTPConnection`,
         :class:`urllib3.connection.HTTPSConnection` instances.
@@ -190,6 +211,9 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         _proxy: Url | None = None,
         _proxy_headers: typing.Mapping[str, str] | None = None,
         _proxy_config: ProxyConfig | None = None,
+        fault_isolation: (
+            FaultIsolationConfig | FaultIsolationPolicy | bool | None
+        ) = None,
         **conn_kw: typing.Any,
     ):
         ConnectionPool.__init__(self, host, port)
@@ -203,6 +227,13 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
 
         self.timeout = timeout
         self.retries = retries
+
+        # Per-pool fault state. A shared config passed through a PoolManager
+        # yields one independent policy per sub-pool, so only the faulty
+        # target is isolated.
+        self.fault_isolation: FaultIsolationPolicy | None = create_fault_isolation(
+            fault_isolation
+        )
 
         self.pool: queue.LifoQueue[typing.Any] | None = self._new_pool_queue(maxsize)
         self.block = block
@@ -348,6 +379,32 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
     def _prepare_proxy(self, conn: BaseHTTPConnection) -> None:
         # Nothing to do for HTTP connections.
         pass
+
+    def _fault_acquire(self) -> FaultPermit:
+        """
+        Acquire a fault-isolation permit, converting the policy's internal
+        rejection signal into the public :class:`FaultIsolationError`.
+        """
+        assert self.fault_isolation is not None
+        try:
+            return self.fault_isolation.acquire()
+        except _FaultIsolationOpen as e:
+            raise FaultIsolationError(
+                self,
+                reason=e.reason,
+                remaining_recovery_time=e.remaining,
+                probe_in_flight=e.probe_in_flight,
+            ) from None
+
+    def fault_isolation_snapshot(self) -> FaultSnapshot | None:
+        """
+        Return a :class:`urllib3.FaultSnapshot` describing the fault isolation
+        state (open reason, remaining cooldown, probe occupancy and recovery
+        result), or ``None`` when fault isolation is not enabled.
+        """
+        if self.fault_isolation is None:
+            return None
+        return self.fault_isolation.snapshot()
 
     def _get_timeout(self, timeout: _TYPE_TIMEOUT) -> Timeout:
         """Helper that always returns a :class:`urllib3.util.Timeout`"""
@@ -570,6 +627,11 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         # Disable access to the pool
         old_pool, self.pool = self.pool, None
 
+        # Closing drops any accumulated fault state along with the pool. A
+        # later (dynamically created) pool starts from a clean state again.
+        if self.fault_isolation is not None:
+            self.fault_isolation.reset()
+
         # Close all the HTTPConnections in the pool.
         _close_pool_connections(old_pool)
 
@@ -746,7 +808,12 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
 
         # Must keep the exception bound to a separate variable or else Python 3
         # complains about UnboundLocalError.
-        err = None
+        err: Exception | None = None
+
+        # Fault-isolation permit for this attempt. ``None`` when fault
+        # isolation is disabled or admission was rejected before a permit was
+        # granted.
+        fault_permit: FaultPermit | None = None
 
         # Keep track of whether we cleanly exited the except block. This
         # ensures we do proper cleanup in finally.
@@ -758,6 +825,13 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
 
         timeout_obj = self._get_timeout(timeout)
         try:
+            # Fault isolation gates connection attempts before touching the
+            # pool queue, so waiting/in-use/idle connections are never
+            # disturbed. Rejection is raised inside this try so Retry handles
+            # it like any other connection failure.
+            if self.fault_isolation is not None:
+                fault_permit = self._fault_acquire()
+
             # Request a connection from the queue.
             conn = self._get_conn(timeout=pool_timeout)
             conn.timeout = timeout_obj.connect_timeout  # type: ignore[assignment]
@@ -794,6 +868,12 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 **response_kw,
             )
 
+            # A response means the connection worked: atomically clear any
+            # open fault state, unless this status code was configured to
+            # count as a target failure.
+            if self.fault_isolation is not None:
+                fault_permit.record_status(response.status)  # type: ignore[union-attr]
+
             # Everything went great!
             clean_exit = True
 
@@ -802,6 +882,19 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
             clean_exit = True
             release_this_conn = False
             raise
+
+        except FaultIsolationError as e:
+            # Rejected by fault isolation before any queue token or
+            # connection was taken: leave waiting/in-use/idle connections
+            # untouched and do not put anything back into the pool. Retry
+            # still accounts for the attempt.
+            clean_exit = True
+            release_this_conn = False
+            retries = retries.increment(
+                method, url, error=e, _pool=self, _stacktrace=sys.exc_info()[2]
+            )
+            retries.sleep()
+            err = e
 
         except (
             TimeoutError,
@@ -833,6 +926,18 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
             elif isinstance(new_e, (OSError, HTTPException)):
                 new_e = ProtocolError("Connection aborted.", new_e)
 
+            # Record the fault for this attempt, exactly once. A rejected
+            # attempt (FaultIsolationError raised before a permit was granted)
+            # is not a new failure and must not be counted again.
+            if self.fault_isolation is not None and fault_permit is not None:
+                reason = classify_connection_fault(
+                    e, new_e, self.fault_isolation.config
+                )
+                if reason is not None:
+                    fault_permit.record_failure(reason, new_e)
+                else:
+                    fault_permit.abandon()
+
             retries = retries.increment(
                 method, url, error=new_e, _pool=self, _stacktrace=sys.exc_info()[2]
             )
@@ -841,7 +946,25 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
             # Keep track of the error for the retry warning.
             err = e
 
+        except BaseException as e:
+            # Caller-initiated cancellation (or any other escaping error):
+            # count it only when explicitly configured, otherwise release the
+            # permit neutrally. Existing connection cleanup in ``finally`` is
+            # left untouched.
+            if self.fault_isolation is not None and fault_permit is not None:
+                if (
+                    self.fault_isolation.config.count_cancelled
+                    and is_user_cancellation(e)
+                ):
+                    fault_permit.record_failure(FaultReason.CANCELLED, e)
+                else:
+                    fault_permit.abandon()
+            raise
+
         finally:
+            if fault_permit is not None:
+                fault_permit.release()
+
             if not clean_exit:
                 # We hit some kind of exception, handled or otherwise. We need
                 # to throw the connection away unless explicitly told not to.
@@ -1020,6 +1143,9 @@ class HTTPSConnectionPool(HTTPConnectionPool):
         assert_hostname: str | typing.Literal[False] | None = None,
         assert_fingerprint: str | None = None,
         ca_cert_dir: str | None = None,
+        fault_isolation: (
+            FaultIsolationConfig | FaultIsolationPolicy | bool | None
+        ) = None,
         **conn_kw: typing.Any,
     ) -> None:
         super().__init__(
@@ -1032,6 +1158,7 @@ class HTTPSConnectionPool(HTTPConnectionPool):
             retries,
             _proxy,
             _proxy_headers,
+            fault_isolation=fault_isolation,
             **conn_kw,
         )
 

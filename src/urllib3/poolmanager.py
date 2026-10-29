@@ -23,6 +23,11 @@ from .exceptions import (
     ProxySchemeUnknown,
     URLSchemeUnknown,
 )
+from .faultisolation import (
+    FaultIsolationConfig,
+    FaultIsolationPolicy,
+    FaultSnapshot,
+)
 from .response import BaseHTTPResponse
 from .util.connection import _TYPE_SOCKET_OPTIONS
 from .util.proxy import connection_requires_http_tunnel
@@ -98,6 +103,7 @@ class PoolKey(typing.NamedTuple):
     key_assert_fingerprint: str | None
     key_server_hostname: str | None
     key_blocksize: int | None
+    key_fault_isolation: FaultIsolationConfig | None
 
 
 def _default_key_normalizer(
@@ -230,6 +236,27 @@ class PoolManager(RequestMethods):
                 retries = Retry.from_int(retries)
                 connection_pool_kw = connection_pool_kw.copy()
                 connection_pool_kw["retries"] = retries
+        # A fault isolation policy carries per-pool state. Propagate only an
+        # immutable configuration so every dynamically created sub-pool
+        # isolates its own target with an independent state machine, while
+        # sharing identical thresholds and counting rules.
+        if "fault_isolation" in connection_pool_kw:
+            fault_isolation = connection_pool_kw["fault_isolation"]
+            if isinstance(fault_isolation, FaultIsolationPolicy):
+                propagated: FaultIsolationConfig | None = fault_isolation.config
+            elif isinstance(fault_isolation, FaultIsolationConfig):
+                propagated = fault_isolation
+            elif fault_isolation is True:
+                propagated = FaultIsolationConfig()
+            elif fault_isolation is False:
+                propagated = None
+            else:
+                propagated = fault_isolation
+            connection_pool_kw = connection_pool_kw.copy()
+            if propagated is None:
+                connection_pool_kw.pop("fault_isolation")
+            else:
+                connection_pool_kw["fault_isolation"] = propagated
         self.connection_pool_kw = connection_pool_kw
 
         self.pools: RecentlyUsedContainer[PoolKey, HTTPConnectionPool]
@@ -299,6 +326,26 @@ class PoolManager(RequestMethods):
         re-used after completion.
         """
         self.pools.clear()
+
+    def fault_isolation_snapshots(self) -> dict[str, FaultSnapshot]:
+        """
+        Return the current :class:`urllib3.FaultSnapshot` of every cached
+        sub-pool with fault isolation enabled, keyed by
+        ``"{scheme}://{host}:{port}"``.
+
+        Each sub-pool owns an independent state; evicted or cleared pools no
+        longer appear here and a dynamically created replacement pool starts
+        from a clean state.
+        """
+        with self.pools.lock:
+            pools = list(self.pools._container.values())
+
+        snapshots: dict[str, FaultSnapshot] = {}
+        for pool in pools:
+            snapshot = pool.fault_isolation_snapshot()
+            if snapshot is not None:
+                snapshots[f"{pool.scheme}://{pool.host}:{pool.port}"] = snapshot
+        return snapshots
 
     def connection_from_host(
         self,

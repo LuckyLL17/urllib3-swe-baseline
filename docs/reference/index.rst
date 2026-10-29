@@ -6,6 +6,7 @@ API Reference
    urllib3.request
    urllib3.poolmanager
    urllib3.connectionpool
+   urllib3.faultisolation
    urllib3.connection
    urllib3.exceptions
    urllib3.response

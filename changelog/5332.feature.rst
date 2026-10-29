@@ -1,0 +1,12 @@
+Added an optional connection fault isolation policy (circuit breaker) to
+``HTTPConnectionPool``, ``HTTPSConnectionPool`` and ``PoolManager`` via the new
+``fault_isolation`` parameter and the ``FaultIsolationConfig`` /
+``FaultIsolationPolicy`` APIs. Repeated connection, proxy connection, TLS
+handshake or passive connection-close failures (optionally HTTP status codes,
+response read errors and caller cancellations) open the pool for a configurable
+recovery timeout, after which a single half-open probe request may verify
+recovery. The state, open reason, remaining recovery time, probe occupancy and
+recovery result are available through ``fault_isolation_snapshot()`` and
+``PoolManager.fault_isolation_snapshots()``. The feature is opt-in: with
+``fault_isolation`` unset (the default) connection creation, retries,
+exception types, pool capacity and request timing are unchanged.

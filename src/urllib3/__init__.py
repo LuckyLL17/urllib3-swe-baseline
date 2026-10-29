@@ -16,6 +16,13 @@ from ._base_connection import _TYPE_BODY
 from ._collections import HTTPHeaderDict
 from ._version import __version__
 from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, connection_from_url
+from .faultisolation import (
+    FaultIsolationConfig,
+    FaultIsolationPolicy,
+    FaultReason,
+    FaultSnapshot,
+    FaultState,
+)
 from .filepost import _TYPE_FIELDS, encode_multipart_formdata
 from .poolmanager import PoolManager, ProxyManager, proxy_from_url
 from .response import BaseHTTPResponse, HTTPResponse
@@ -58,6 +65,11 @@ __all__ = (
     "HTTPResponse",
     "Retry",
     "Timeout",
+    "FaultIsolationConfig",
+    "FaultIsolationPolicy",
+    "FaultReason",
+    "FaultSnapshot",
+    "FaultState",
     "add_stderr_logger",
     "connection_from_url",
     "disable_warnings",

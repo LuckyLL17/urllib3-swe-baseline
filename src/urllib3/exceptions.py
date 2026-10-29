@@ -189,6 +189,45 @@ class ClosedPoolError(PoolError):
     """Raised when a request enters a pool after the pool has been closed."""
 
 
+class FaultIsolationError(PoolError):
+    """Raised when a connection pool rejects a request because its fault
+    isolation policy is open.
+
+    The target temporarily refuses new connection attempts after repeated
+    connection failures; either wait out ``remaining_recovery_time`` or let
+    the controlled half-open recovery probe verify whether the target
+    recovered.
+    """
+
+    def __init__(
+        self,
+        pool: ConnectionPool,
+        reason: str | None,
+        remaining_recovery_time: float | None,
+        probe_in_flight: bool,
+    ) -> None:
+        self.reason = reason
+        self.remaining_recovery_time = remaining_recovery_time
+        self.probe_in_flight = probe_in_flight
+        if probe_in_flight:
+            message = (
+                "Connection target is isolated and a recovery probe is "
+                "already in progress."
+            )
+        else:
+            remaining = (
+                f"{remaining_recovery_time:.3f}s"
+                if remaining_recovery_time is not None
+                else "unknown"
+            )
+            reason_part = f" (last failure: {reason})" if reason else ""
+            message = (
+                f"Connection target is temporarily isolated{reason_part}; "
+                f"new connection attempts are rejected for {remaining} more."
+            )
+        super().__init__(pool, message)
+
+
 class LocationValueError(ValueError, HTTPError):
     """Raised when there is something wrong with a given URL input."""
 

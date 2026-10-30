@@ -1,0 +1,11 @@
+Added optional TLS handshake result reporting. With ``tls_handshake_reporting=True`` on
+``PoolManager``, ``ProxyManager``, ``HTTPSConnectionPool`` or ``HTTPSConnection``, the
+immutable ``TLSHandshakeResult`` is queryable from connections, pools, managers and
+pooled/re-used ``HTTPResponse`` objects. It records a stable connection identity, target
+host, SNI, proxy usage and CONNECT tunnel state, TLS completion, certificate verification,
+negotiated TLS version, cipher suite, ALPN, peer certificate SHA-256 fingerprint and the
+failure stage (TCP, proxy TLS, proxy CONNECT, TLS, certificate, hostname, ALPN, closed).
+The same structure is used for direct TLS, HTTPS proxies and HTTP CONNECT proxies; queries
+never perform network I/O, user-supplied ``SSLContext`` objects are restored after
+connecting, and no private key or certificate content is exposed. The capability is opt-in
+and default behavior is unchanged.

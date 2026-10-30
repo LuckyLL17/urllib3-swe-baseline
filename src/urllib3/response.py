@@ -17,6 +17,7 @@ from socket import timeout as SocketTimeout
 
 if typing.TYPE_CHECKING:
     from ._base_connection import BaseHTTPConnection
+    from .tls import TLSHandshakeResult
 
 try:
     try:
@@ -531,6 +532,11 @@ class BaseHTTPResponse(io.IOBase):
         self._decoder_initialized = False
         self.length_remaining: int | None
 
+        # Immutable snapshot of the TLS handshake result of the connection
+        # that served this response. None unless TLS handshake reporting was
+        # enabled. Survives the connection being released/re-used.
+        self._tls_handshake_result: TLSHandshakeResult | None = None
+
     def get_redirect_location(self) -> str | None | typing.Literal[False]:
         """
         Should we redirect and where to?
@@ -579,6 +585,16 @@ class BaseHTTPResponse(io.IOBase):
     @property
     def connection(self) -> BaseHTTPConnection | None:
         raise NotImplementedError()
+
+    @property
+    def tls_handshake_result(self) -> TLSHandshakeResult | None:
+        """
+        Immutable TLS handshake result snapshot of the connection that served
+        this response, or ``None`` when TLS handshake reporting is disabled.
+        Reading this never initiates network activity and stays valid after the
+        underlying connection is released to the pool and re-used.
+        """
+        return self._tls_handshake_result
 
     @property
     def retries(self) -> Retry | None:

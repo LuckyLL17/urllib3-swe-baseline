@@ -33,6 +33,7 @@ if typing.TYPE_CHECKING:
     from typing import Protocol
 
     from .response import BaseHTTPResponse
+    from .tls import TLSHandshakeRecorder
 
     class BaseHTTPConnection(Protocol):
         default_port: typing.ClassVar[int]
@@ -164,4 +165,6 @@ if typing.TYPE_CHECKING:
             cert_file: str | None = None,
             key_file: str | None = None,
             key_password: str | None = None,
+            tls_handshake_reporting: bool = False,
+            _tls_recorder: TLSHandshakeRecorder | None = None,
         ) -> None: ...

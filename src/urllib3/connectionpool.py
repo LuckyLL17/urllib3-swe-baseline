@@ -40,6 +40,7 @@ from .exceptions import (
     TimeoutError,
 )
 from .response import BaseHTTPResponse
+from .tls import TLSHandshakeRecorder
 from .util.connection import is_connection_dropped
 from .util.proxy import connection_requires_http_tunnel
 from .util.request import _TYPE_BODY_POSITION, set_file_position
@@ -57,6 +58,7 @@ if typing.TYPE_CHECKING:
     from typing_extensions import Self
 
     from ._base_connection import BaseHTTPConnection, BaseHTTPSConnection
+    from .tls import TLSHandshakeResult
 
 log = logging.getLogger(__name__)
 
@@ -190,10 +192,20 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         _proxy: Url | None = None,
         _proxy_headers: typing.Mapping[str, str] | None = None,
         _proxy_config: ProxyConfig | None = None,
+        tls_handshake_reporting: bool = False,
+        _tls_recorder: TLSHandshakeRecorder | None = None,
         **conn_kw: typing.Any,
     ):
         ConnectionPool.__init__(self, host, port)
         RequestMethods.__init__(self, headers)
+
+        # Optional TLS handshake reporting. Disabled by default.
+        self._tls_handshake_reporting = tls_handshake_reporting
+        self._tls_recorder = (
+            _tls_recorder
+            if _tls_recorder is not None
+            else TLSHandshakeRecorder() if tls_handshake_reporting else None
+        )
 
         if not isinstance(timeout, Timeout):
             timeout = Timeout.from_float(timeout)
@@ -572,6 +584,16 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
 
         # Close all the HTTPConnections in the pool.
         _close_pool_connections(old_pool)
+
+    def get_tls_handshake_result(self) -> TLSHandshakeResult | None:
+        """
+        Return the most recent TLS handshake result recorded by connections
+        of this pool, or ``None`` when TLS handshake reporting is disabled.
+        This never initiates a network connection.
+        """
+        if self._tls_recorder is None:
+            return None
+        return self._tls_recorder.latest()
 
     def is_same_host(self, url: str) -> bool:
         """
@@ -1100,6 +1122,8 @@ class HTTPSConnectionPool(HTTPConnectionPool):
             ssl_version=self.ssl_version,
             ssl_minimum_version=self.ssl_minimum_version,
             ssl_maximum_version=self.ssl_maximum_version,
+            tls_handshake_reporting=self._tls_handshake_reporting,
+            _tls_recorder=self._tls_recorder,
             **self.conn_kw,
         )
 

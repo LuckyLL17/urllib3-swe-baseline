@@ -50,6 +50,15 @@ from .exceptions import (
     ProxyError,
     SystemTimeWarning,
 )
+from .tls import (
+    TLSHandshakeRecorder,
+    TLSHandshakeResult,
+    TLSHandshakeStage,
+    _ConnectTracker,
+    classify_failure_stage,
+    restore_ssl_context,
+    snapshot_ssl_context,
+)
 from .util import SKIP_HEADER, SKIPPABLE_HEADERS, connection, ssl_
 from .util.request import body_to_chunks
 from .util.ssl_ import assert_fingerprint as _assert_fingerprint
@@ -207,6 +216,11 @@ class HTTPConnection(_HTTPConnection):
         self._tunnel_host: str | None = None
         self._tunnel_port: int | None = None
         self._tunnel_scheme: str | None = None
+
+        # Optional TLS handshake reporting. Disabled by default.
+        self._tls_reporting = False
+        self._tls_recorder: TLSHandshakeRecorder | None = None
+        self._tls_result: TLSHandshakeResult | None = None
 
     def __str__(self) -> str:
         return f"{type(self).__name__}(host={self.host!r}, port={self.port!r})"
@@ -452,10 +466,33 @@ class HTTPConnection(_HTTPConnection):
         """
         return self._tunnel_host is not None
 
+    @property
+    def tls_handshake_result(self) -> TLSHandshakeResult | None:
+        """
+        Result of the most recent TLS handshake performed by this connection,
+        or ``None`` if TLS handshake reporting is disabled (or no handshake
+        has been attempted yet). Reading this property never initiates I/O.
+        """
+        return self._tls_result
+
+    def _tls_note_closed(self) -> None:
+        """Publish a closed copy of the last result. Idempotent and safe."""
+        result = self._tls_result
+        recorder = self._tls_recorder
+        if result is None or recorder is None or result.closed:
+            return
+        try:
+            closed_result = result._replace(closed=True)
+            recorder.record(closed_result)
+            self._tls_result = closed_result
+        except Exception:
+            pass
+
     def close(self) -> None:
         try:
             super().close()
         finally:
+            self._tls_note_closed()
             # Reset all stateful properties so connection
             # can be re-used without leaking prior configs.
             self.sock = None
@@ -691,6 +728,14 @@ class HTTPConnection(_HTTPConnection):
             request_url=resp_options.request_url,
             sock_shutdown=_shutdown,
         )
+
+        # Snapshot the immutable handshake result so this response keeps
+        # reporting its own connection even if the connection is released
+        # back to the pool and re-used later.
+        tls_result = self._tls_result
+        if tls_result is not None:
+            response._tls_handshake_result = tls_result
+
         return response
 
 
@@ -739,6 +784,8 @@ class HTTPSConnection(HTTPConnection):
         cert_file: str | None = None,
         key_file: str | None = None,
         key_password: str | None = None,
+        tls_handshake_reporting: bool = False,
+        _tls_recorder: TLSHandshakeRecorder | None = None,
     ) -> None:
         super().__init__(
             host,
@@ -750,6 +797,11 @@ class HTTPSConnection(HTTPConnection):
             proxy=proxy,
             proxy_config=proxy_config,
         )
+
+        self._tls_reporting = tls_handshake_reporting
+        self._tls_recorder = _tls_recorder
+        if tls_handshake_reporting and self._tls_recorder is None:
+            self._tls_recorder = TLSHandshakeRecorder()
 
         self.key_file = key_file
         self.cert_file = cert_file
@@ -848,9 +900,16 @@ class HTTPSConnection(HTTPConnection):
                 target_supports_http2=target_supports_http2,
             )
 
+        report = self._tls_begin_report()
+
         try:
             sock: socket.socket | ssl.SSLSocket
-            self.sock = sock = self._new_conn()
+            try:
+                self.sock = sock = self._new_conn()
+            except BaseException as e:
+                if report is not None:
+                    report.fail(e, TLSHandshakeStage.TCP_CONNECT)
+                raise
             server_hostname: str = self.host
             tls_in_tls = False
 
@@ -859,7 +918,14 @@ class HTTPSConnection(HTTPConnection):
                 # We're tunneling to an HTTPS origin so need to do TLS-in-TLS.
                 if self._tunnel_scheme == "https":
                     # _connect_tls_proxy will verify and assign proxy_is_verified
-                    self.sock = sock = self._connect_tls_proxy(self.host, sock)
+                    try:
+                        self.sock = sock = self._connect_tls_proxy(
+                            self.host, sock, report=report
+                        )
+                    except BaseException as e:
+                        if report is not None:
+                            report.fail(e, TLSHandshakeStage.PROXY_TLS)
+                        raise
                     tls_in_tls = True
                 elif self._tunnel_scheme == "http":
                     self.proxy_is_verified = False
@@ -867,7 +933,15 @@ class HTTPSConnection(HTTPConnection):
                 # If we're tunneling it means we're connected to our proxy.
                 self._has_connected_to_proxy = True
 
-                self._tunnel()
+                try:
+                    self._tunnel()
+                except BaseException as e:
+                    if report is not None:
+                        report.proxy_connect_failed(e)
+                        report.fail(e, TLSHandshakeStage.PROXY_CONNECT)
+                    raise
+                if report is not None:
+                    report.tunnel_succeeded()
                 # Override the host with the one we're requesting data from.
                 server_hostname = typing.cast(str, self._tunnel_host)
 
@@ -898,8 +972,21 @@ class HTTPSConnection(HTTPConnection):
             # ``ProxyManager.__init__``.
             wrapped_socket: ssl.SSLSocket | SSLTransport
             if self.proxy_is_forwarding and self.proxy_config is not None:
-                wrapped_socket = self._connect_tls_proxy(self.host, sock)
+                try:
+                    wrapped_socket = self._connect_tls_proxy(
+                        self.host, sock, report=report
+                    )
+                except BaseException as e:
+                    if report is not None:
+                        report.fail(e, TLSHandshakeStage.PROXY_TLS)
+                    raise
                 is_verified = self.proxy_is_verified is True
+                if report is not None:
+                    report.forwarding_succeeded(
+                        wrapped_socket,
+                        sni=self.host,
+                        cert_verified=is_verified,
+                    )
             else:
                 wrapped_socket, is_verified = _ssl_wrap_socket_and_match_hostname(
                     sock=sock,
@@ -918,12 +1005,28 @@ class HTTPSConnection(HTTPConnection):
                     tls_in_tls=tls_in_tls,
                     assert_hostname=self.assert_hostname,
                     assert_fingerprint=self.assert_fingerprint,
+                    _tls_stage_note=(
+                        report.stage_sink("target") if report is not None else None
+                    ),
+                    _tls_preserve_context=report is not None,
                 )
+                if report is not None:
+                    report.target_succeeded(
+                        wrapped_socket,
+                        sni=server_hostname_rm_dot,
+                        cert_verified=is_verified,
+                    )
             self.sock = wrapped_socket
+            if report is not None:
+                self._tls_result = report.result
 
         # If an error occurs during connection/handshake we may need to release
         # our lock so another connection can probe the origin.
-        except BaseException:
+        except BaseException as e:
+            if report is not None:
+                report.fail(e)
+                self._tls_result = report.result
+
             if self._connect_callback is not None:
                 self._connect_callback(
                     "after connect failure",
@@ -966,7 +1069,34 @@ class HTTPSConnection(HTTPConnection):
         if self._has_connected_to_proxy and self.proxy_is_verified is None:
             self.proxy_is_verified = is_verified
 
-    def _connect_tls_proxy(self, hostname: str, sock: socket.socket) -> ssl.SSLSocket:
+    def _tls_begin_report(self) -> _ConnectTracker | None:
+        """Create the per-connect() reporting tracker, or None."""
+        if not self._tls_reporting or self._tls_recorder is None:
+            return None
+        if self.proxy_is_tunneling:
+            target_host = self._tunnel_host or self.host
+            target_port = self._tunnel_port or self.port
+        else:
+            target_host = self.host
+            target_port = self.port
+        proxy = self.proxy
+        return _ConnectTracker(
+            self._tls_recorder,
+            target_host=target_host,
+            target_port=target_port,
+            used_proxy=bool(proxy),
+            proxy_scheme=proxy.scheme if proxy is not None else None,
+            proxy_host=proxy.host if proxy is not None else None,
+            proxy_port=proxy.port if proxy is not None else None,
+        )
+
+    def _connect_tls_proxy(
+        self,
+        hostname: str,
+        sock: socket.socket,
+        *,
+        report: _ConnectTracker | None = None,
+    ) -> ssl.SSLSocket:
         """
         Establish a TLS connection to the proxy using proxy-specific policy.
         """
@@ -996,25 +1126,40 @@ class HTTPSConnection(HTTPConnection):
             ssl_minimum_version = self.ssl_minimum_version
             ssl_maximum_version = self.ssl_maximum_version
 
-        sock_and_verified = _ssl_wrap_socket_and_match_hostname(
-            sock,
-            cert_reqs=cert_reqs,
-            ssl_version=ssl_version,
-            ssl_minimum_version=ssl_minimum_version,
-            ssl_maximum_version=ssl_maximum_version,
-            ca_certs=ca_certs,
-            ca_cert_dir=ca_cert_dir,
-            ca_cert_data=ca_cert_data,
-            server_hostname=hostname,
-            ssl_context=ssl_context,
-            assert_hostname=proxy_config.assert_hostname,
-            assert_fingerprint=proxy_config.assert_fingerprint,
-            # Features that aren't implemented for proxies yet:
-            cert_file=None,
-            key_file=None,
-            key_password=None,
-            tls_in_tls=False,
-        )
+        try:
+            sock_and_verified = _ssl_wrap_socket_and_match_hostname(
+                sock,
+                cert_reqs=cert_reqs,
+                ssl_version=ssl_version,
+                ssl_minimum_version=ssl_minimum_version,
+                ssl_maximum_version=ssl_maximum_version,
+                ca_certs=ca_certs,
+                ca_cert_dir=ca_cert_dir,
+                ca_cert_data=ca_cert_data,
+                server_hostname=hostname,
+                ssl_context=ssl_context,
+                assert_hostname=proxy_config.assert_hostname,
+                assert_fingerprint=proxy_config.assert_fingerprint,
+                # Features that aren't implemented for proxies yet:
+                cert_file=None,
+                key_file=None,
+                key_password=None,
+                tls_in_tls=False,
+                _tls_stage_note=(
+                    report.stage_sink("proxy") if report is not None else None
+                ),
+                _tls_preserve_context=report is not None,
+            )
+        except BaseException as e:
+            if report is not None:
+                report.proxy_tls_failed(e, sni=hostname)
+            raise
+        if report is not None:
+            report.proxy_tls_succeeded(
+                sock_and_verified.socket,
+                sni=hostname,
+                cert_verified=sock_and_verified.is_verified,
+            )
         self.proxy_is_verified = sock_and_verified.is_verified
         return sock_and_verified.socket  # type: ignore[return-value]
 
@@ -1047,6 +1192,8 @@ def _ssl_wrap_socket_and_match_hostname(
     server_hostname: str | None,
     ssl_context: ssl.SSLContext | None,
     tls_in_tls: bool = False,
+    _tls_stage_note: typing.Callable[..., None] | None = None,
+    _tls_preserve_context: bool = False,
 ) -> _WrappedAndVerifiedSocket:
     """Logic for constructing an SSLContext from all TLS parameters, passing
     that down into ssl_wrap_socket, and then doing certificate verification
@@ -1065,93 +1212,119 @@ def _ssl_wrap_socket_and_match_hostname(
     else:
         context = ssl_context
 
-    context.verify_mode = resolve_cert_reqs(cert_reqs)
-
-    # In some cases, we want to verify hostnames ourselves
-    if (
-        # `ssl` can't verify fingerprints or alternate hostnames
-        assert_fingerprint
-        or assert_hostname
-        # assert_hostname can be set to False to disable hostname checking
-        or assert_hostname is False
-        # We still support OpenSSL 1.0.2, which prevents us from verifying
-        # hostnames easily: https://github.com/pyca/pyopenssl/pull/933
-        or ssl_.IS_PYOPENSSL
-        or not ssl_.HAS_NEVER_CHECK_COMMON_NAME
-    ):
-        context.check_hostname = False
-
-    # Try to load OS default certs if none are given. We need to do the hasattr() check
-    # for custom pyOpenSSL SSLContext objects because they don't support
-    # load_default_certs().
-    if (
-        not ca_certs
-        and not ca_cert_dir
-        and not ca_cert_data
-        and default_ssl_context
-        and hasattr(context, "load_default_certs")
-    ):
-        context.load_default_certs()
-
-    # Ensure that IPv6 addresses are in the proper format and don't have a
-    # scope ID. Python's SSL module fails to recognize scoped IPv6 addresses
-    # and interprets them as DNS hostnames.
-    if server_hostname is not None:
-        normalized = server_hostname.strip("[]")
-        if "%" in normalized:
-            normalized = normalized[: normalized.rfind("%")]
-        if is_ipaddress(normalized):
-            server_hostname = normalized
-
-    ssl_sock = ssl_wrap_socket(
-        sock=sock,
-        keyfile=key_file,
-        certfile=cert_file,
-        key_password=key_password,
-        ca_certs=ca_certs,
-        ca_cert_dir=ca_cert_dir,
-        ca_cert_data=ca_cert_data,
-        server_hostname=server_hostname,
-        ssl_context=context,
-        tls_in_tls=tls_in_tls,
-    )
+    # When TLS handshake reporting is enabled, a user-supplied SSLContext
+    # must be left untouched: snapshot it and restore every policy attribute
+    # after the handshake (regardless of its outcome).
+    tls_context_snapshot: tuple[typing.Any, ...] | None = None
+    if _tls_preserve_context and not default_ssl_context:
+        tls_context_snapshot = snapshot_ssl_context(context)
 
     try:
-        if assert_fingerprint:
-            _assert_fingerprint(
-                ssl_sock.getpeercert(binary_form=True), assert_fingerprint
-            )
-        elif (
-            context.verify_mode != ssl.CERT_NONE
-            and not context.check_hostname
-            and assert_hostname is not False
+        context.verify_mode = resolve_cert_reqs(cert_reqs)
+
+        # In some cases, we want to verify hostnames ourselves
+        if (
+            # `ssl` can't verify fingerprints or alternate hostnames
+            assert_fingerprint
+            or assert_hostname
+            # assert_hostname can be set to False to disable hostname checking
+            or assert_hostname is False
+            # We still support OpenSSL 1.0.2, which prevents us from verifying
+            # hostnames easily: https://github.com/pyca/pyopenssl/pull/933
+            or ssl_.IS_PYOPENSSL
+            or not ssl_.HAS_NEVER_CHECK_COMMON_NAME
         ):
-            cert: _TYPE_PEER_CERT_RET_DICT = ssl_sock.getpeercert()  # type: ignore[assignment]
+            context.check_hostname = False
 
-            # Need to signal to our match_hostname whether to use 'commonName' or not.
-            # If we're using our own constructed SSLContext we explicitly set 'False'
-            # because PyPy hard-codes 'True' from SSLContext.hostname_checks_common_name.
-            if default_ssl_context:
-                hostname_checks_common_name = False
-            else:
-                hostname_checks_common_name = (
-                    getattr(context, "hostname_checks_common_name", False) or False
-                )
+        # Try to load OS default certs if none are given. We need to do the hasattr() check
+        # for custom pyOpenSSL SSLContext objects because they don't support
+        # load_default_certs().
+        if (
+            not ca_certs
+            and not ca_cert_dir
+            and not ca_cert_data
+            and default_ssl_context
+            and hasattr(context, "load_default_certs")
+        ):
+            context.load_default_certs()
 
-            _match_hostname(
-                cert,
-                assert_hostname or server_hostname,  # type: ignore[arg-type]
-                hostname_checks_common_name,
+        # Ensure that IPv6 addresses are in the proper format and don't have a
+        # scope ID. Python's SSL module fails to recognize scoped IPv6 addresses
+        # and interprets them as DNS hostnames.
+        if server_hostname is not None:
+            normalized = server_hostname.strip("[]")
+            if "%" in normalized:
+                normalized = normalized[: normalized.rfind("%")]
+            if is_ipaddress(normalized):
+                server_hostname = normalized
+
+        try:
+            ssl_sock = ssl_wrap_socket(
+                sock=sock,
+                keyfile=key_file,
+                certfile=cert_file,
+                key_password=key_password,
+                ca_certs=ca_certs,
+                ca_cert_dir=ca_cert_dir,
+                ca_cert_data=ca_cert_data,
+                server_hostname=server_hostname,
+                ssl_context=context,
+                tls_in_tls=tls_in_tls,
             )
+        except BaseException as e:
+            if _tls_stage_note is not None:
+                _tls_stage_note(classify_failure_stage(e), e, None)
+            raise
 
-        return _WrappedAndVerifiedSocket(
-            socket=ssl_sock,
-            is_verified=context.verify_mode == ssl.CERT_REQUIRED
-            or bool(assert_fingerprint),
-        )
-    except BaseException:
-        ssl_sock.close()
-        raise
+        try:
+            if assert_fingerprint:
+                try:
+                    _assert_fingerprint(
+                        ssl_sock.getpeercert(binary_form=True), assert_fingerprint
+                    )
+                except BaseException as e:
+                    if _tls_stage_note is not None:
+                        _tls_stage_note(TLSHandshakeStage.CERTIFICATE, e, ssl_sock)
+                    raise
+            elif (
+                context.verify_mode != ssl.CERT_NONE
+                and not context.check_hostname
+                and assert_hostname is not False
+            ):
+                cert: _TYPE_PEER_CERT_RET_DICT = ssl_sock.getpeercert()  # type: ignore[assignment]
+
+                # Need to signal to our match_hostname whether to use 'commonName' or not.
+                # If we're using our own constructed SSLContext we explicitly set 'False'
+                # because PyPy hard-codes 'True' from SSLContext.hostname_checks_common_name.
+                if default_ssl_context:
+                    hostname_checks_common_name = False
+                else:
+                    hostname_checks_common_name = (
+                        getattr(context, "hostname_checks_common_name", False) or False
+                    )
+
+                try:
+                    _match_hostname(
+                        cert,
+                        assert_hostname or server_hostname,  # type: ignore[arg-type]
+                        hostname_checks_common_name,
+                    )
+                except BaseException as e:
+                    if _tls_stage_note is not None:
+                        _tls_stage_note(TLSHandshakeStage.HOSTNAME, e, ssl_sock)
+                    raise
+
+            return _WrappedAndVerifiedSocket(
+                socket=ssl_sock,
+                is_verified=context.verify_mode == ssl.CERT_REQUIRED
+                or bool(assert_fingerprint),
+            )
+        except BaseException:
+            ssl_sock.close()
+            raise
+    finally:
+        if tls_context_snapshot is not None:
+            restore_ssl_context(context, tls_context_snapshot)
 
 
 def _match_hostname(

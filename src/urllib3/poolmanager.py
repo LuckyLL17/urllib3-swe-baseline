@@ -24,6 +24,7 @@ from .exceptions import (
     URLSchemeUnknown,
 )
 from .response import BaseHTTPResponse
+from .tls import TLSHandshakeRecorder
 from .util.connection import _TYPE_SOCKET_OPTIONS
 from .util.proxy import connection_requires_http_tunnel
 from .util.retry import Retry
@@ -34,6 +35,8 @@ if typing.TYPE_CHECKING:
     import ssl
 
     from typing_extensions import Self
+
+    from .tls import TLSHandshakeResult
 
 __all__ = ["PoolManager", "ProxyManager", "proxy_from_url"]
 
@@ -98,6 +101,8 @@ class PoolKey(typing.NamedTuple):
     key_assert_fingerprint: str | None
     key_server_hostname: str | None
     key_blocksize: int | None
+    key_tls_handshake_reporting: bool | None
+    key__tls_recorder: TLSHandshakeRecorder | None
 
 
 def _default_key_normalizer(
@@ -213,9 +218,21 @@ class PoolManager(RequestMethods):
         self,
         num_pools: int = 10,
         headers: typing.Mapping[str, str] | None = None,
+        tls_handshake_reporting: bool = False,
         **connection_pool_kw: typing.Any,
     ) -> None:
         super().__init__(headers)
+
+        # Optional TLS handshake reporting. Disabled by default. A single
+        # recorder is shared with every pool (and connection) this manager
+        # creates so cross-host results are queryable in one place.
+        self._tls_handshake_reporting = tls_handshake_reporting
+        self._tls_recorder: TLSHandshakeRecorder | None = (
+            TLSHandshakeRecorder() if tls_handshake_reporting else None
+        )
+        if tls_handshake_reporting:
+            connection_pool_kw["tls_handshake_reporting"] = True
+            connection_pool_kw["_tls_recorder"] = self._tls_recorder
         # PoolManager handles redirects itself in PoolManager.urlopen().
         # It always passes redirect=False to the underlying connection pool to
         # suppress per-pool redirect handling. If the user supplied a non-Retry
@@ -397,6 +414,45 @@ class PoolManager(RequestMethods):
         return self.connection_from_host(
             u.host, port=u.port, scheme=u.scheme, pool_kwargs=pool_kwargs
         )
+
+    def _tls_resolve_pool_locator(self, u: Url) -> tuple[str | None, int | None, str]:
+        return u.host, u.port, (u.scheme or "http").lower()
+
+    def get_tls_handshake_result(
+        self, url: str | None = None
+    ) -> TLSHandshakeResult | None:
+        """
+        Query TLS handshake results without initiating any network activity.
+
+        When ``url`` is ``None``, return the most recent result across every
+        pool owned by this manager. When ``url`` is provided, return the most
+        recent result of the existing pool for that URL, or ``None`` if no such
+        pool has been created yet (pools are never created by this query).
+        Returns ``None`` when TLS handshake reporting is disabled.
+        """
+        if self._tls_recorder is None:
+            return None
+        if url is None:
+            return self._tls_recorder.latest()
+
+        u = parse_url(url)
+        host, port, scheme = self._tls_resolve_pool_locator(u)
+        if not host or scheme not in self.key_fn_by_scheme:
+            return None
+        if port is None:
+            port = port_by_scheme.get(scheme, 80)
+
+        request_context = self._merge_pool_kwargs(None)
+        request_context["scheme"] = scheme
+        request_context["port"] = port
+        request_context["host"] = host
+        pool_key = self.key_fn_by_scheme[scheme](request_context)
+
+        with self.pools.lock:
+            pool = self.pools.get(pool_key)
+        if pool is None:
+            return None
+        return pool.get_tls_handshake_result()
 
     def _merge_pool_kwargs(
         self, override: dict[str, typing.Any] | None
@@ -597,6 +653,7 @@ class ProxyManager(PoolManager):
         use_forwarding_for_https: bool = False,
         proxy_assert_hostname: None | str | typing.Literal[False] = None,
         proxy_assert_fingerprint: str | None = None,
+        tls_handshake_reporting: bool = False,
         **connection_pool_kw: typing.Any,
     ) -> None:
         if isinstance(proxy_url, HTTPConnectionPool):
@@ -643,7 +700,20 @@ class ProxyManager(PoolManager):
         connection_pool_kw["_proxy_headers"] = self.proxy_headers
         connection_pool_kw["_proxy_config"] = self.proxy_config
 
-        super().__init__(num_pools, headers, **connection_pool_kw)
+        super().__init__(
+            num_pools,
+            headers,
+            tls_handshake_reporting=tls_handshake_reporting,
+            **connection_pool_kw,
+        )
+
+    def _tls_resolve_pool_locator(self, u: Url) -> tuple[str | None, int | None, str]:
+        # Mirror ProxyManager.connection_from_host(): plain-HTTP requests use
+        # the pool keyed to the proxy itself, HTTPS requests use the target.
+        if (u.scheme or "http").lower() == "https":
+            return u.host, u.port, "https"
+        proxy = typing.cast(Url, self.proxy)
+        return proxy.host, proxy.port, proxy.scheme or "http"
 
     def connection_from_host(
         self,
